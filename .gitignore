@@ -1,1 +1,8 @@
-classification_data/
+__pycache__/
+*.pyc
+__MACOSX/
+.DS_Store
+.ipynb_checkpoints/
+*.zip
+classification_data/*
+!classification_data/.gitignore
