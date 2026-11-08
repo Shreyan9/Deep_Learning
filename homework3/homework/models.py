@@ -2,6 +2,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 HOMEWORK_DIR = Path(__file__).resolve().parent
 INPUT_MEAN = [0.2788, 0.2657, 0.2629]
@@ -80,6 +81,40 @@ class Classifier(nn.Module):
         return self(x).argmax(dim=1)
 
 
+class ConvBlock(nn.Module):
+    """Two 3x3 convs with BatchNorm + ReLU"""
+
+    def __init__(self, c_in: int, c_out: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(c_in, c_out, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c_out),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c_out, c_out, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c_out),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class UpBlock(nn.Module):
+    """Up-convolution, concatenate the skip connection, then a ConvBlock"""
+
+    def __init__(self, c_in: int, c_skip: int, c_out: int):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(c_in, c_out, kernel_size=2, stride=2)
+        self.conv = ConvBlock(c_out + c_skip, c_out)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        # handles odd input sizes where the up-conv output doesn't match the skip
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        return self.conv(torch.cat([x, skip], dim=1))
+
+
 class Detector(torch.nn.Module):
     def __init__(
         self,
@@ -98,8 +133,18 @@ class Detector(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN))
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD))
 
-        # TODO: implement
-        pass
+        # U-Net: encoder halves the resolution 3 times, decoder restores it with skip connections
+        self.enc1 = ConvBlock(in_channels, 16)
+        self.enc2 = ConvBlock(16, 32)
+        self.enc3 = ConvBlock(32, 64)
+        self.bottleneck = ConvBlock(64, 128)
+
+        self.up3 = UpBlock(128, 64, 64)
+        self.up2 = UpBlock(64, 32, 32)
+        self.up1 = UpBlock(32, 16, 16)
+
+        self.seg_head = nn.Conv2d(16, num_classes, kernel_size=1)
+        self.depth_head = nn.Conv2d(16, 1, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -114,12 +159,20 @@ class Detector(torch.nn.Module):
                 - logits (b, num_classes, h, w)
                 - depth (b, h, w)
         """
-        # optional: normalizes the input
         z = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        # TODO: replace with actual forward pass
-        logits = torch.randn(x.size(0), 3, x.size(2), x.size(3))
-        raw_depth = torch.rand(x.size(0), x.size(2), x.size(3))
+        e1 = self.enc1(z)  # (b, 16, h, w)
+        e2 = self.enc2(F.max_pool2d(e1, 2))  # (b, 32, h/2, w/2)
+        e3 = self.enc3(F.max_pool2d(e2, 2))  # (b, 64, h/4, w/4)
+        b = self.bottleneck(F.max_pool2d(e3, 2))  # (b, 128, h/8, w/8)
+
+        d3 = self.up3(b, e3)
+        d2 = self.up2(d3, e2)
+        d1 = self.up1(d2, e1)  # (b, 16, h, w)
+
+        logits = self.seg_head(d1)
+        # depth is normalized to [0, 1]
+        raw_depth = torch.sigmoid(self.depth_head(d1)).squeeze(1)
 
         return logits, raw_depth
 
@@ -228,6 +281,10 @@ def debug_model(batch_size: int = 1):
 
     # should output logits (b, num_classes)
     print(f"Output shape: {output.shape}")
+
+    det = load_model("detector", in_channels=3, num_classes=3).to(device)
+    logits, depth = det(torch.rand(batch_size, 3, 96, 128).to(device))
+    print(f"Detector logits: {logits.shape}, depth: {depth.shape}")
 
 
 if __name__ == "__main__":
